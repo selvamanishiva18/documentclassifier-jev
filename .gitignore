@@ -9,6 +9,15 @@
 *.p12
 secrets/
 .vercel/
+# Terraform state and var files can contain resource details and values; tfvars examples stay tracked.
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+.terraform/
+crash.log
+
+# Terraform provider lock files ARE committed (.terraform.lock.hcl) once generated.
 
 # ---- Python (backend) --------------------------------------------------------
 backend/.venv/

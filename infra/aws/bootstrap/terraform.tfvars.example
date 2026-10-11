@@ -1,0 +1,7 @@
+# Copy to terraform.tfvars (git-ignored) and edit.
+github_repo = "your-org/your-repo"
+aws_region  = "us-east-1"
+project     = "docclassify"
+
+# Set to false if this AWS account already has the GitHub OIDC provider (token.actions.githubusercontent.com).
+create_oidc_provider = true

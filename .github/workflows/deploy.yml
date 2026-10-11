@@ -1,0 +1,260 @@
+name: Deploy (production)
+
+# Where to deploy:
+#   - push to main      -> repository variable DEPLOY_TARGET ("aws" or "vercel"; defaults to "vercel")
+#   - manual run        -> the "target" input chosen in the Actions tab (overrides DEPLOY_TARGET)
+# Setup for each target: AWS_TERRAFORM_DEPLOYMENT.md (secrets and variables table).
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Deploy target
+        type: choice
+        options: [vercel, aws]
+        default: vercel
+      terraform_action:
+        description: "AWS only: plan (no changes), apply (deploy), or destroy (remove everything)"
+        type: choice
+        options: [apply, plan, destroy]
+        default: apply
+
+# One production deploy at a time. Queued runs wait instead of cancelling, so Terraform is never killed mid-apply.
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-target:
+    runs-on: ubuntu-24.04
+    outputs:
+      target: ${{ steps.pick.outputs.target }}
+    steps:
+      - id: pick
+        env:
+          INPUT_TARGET: ${{ inputs.target }}
+          VAR_TARGET: ${{ vars.DEPLOY_TARGET }}
+        run: |
+          target="${INPUT_TARGET:-${VAR_TARGET:-vercel}}"
+          case "$target" in
+            aws|vercel) ;;
+            *) echo "::error::DEPLOY_TARGET must be 'aws' or 'vercel', got '$target'"; exit 1 ;;
+          esac
+          echo "Deploy target: $target"
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------------------------------------------
+  vercel:
+    needs: resolve-target
+    if: needs.resolve-target.outputs.target == 'vercel'
+    runs-on: ubuntu-24.04
+    env:
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+    steps:
+      - name: Check Vercel secrets
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          missing=""
+          [ -n "$VERCEL_TOKEN" ] || missing="$missing VERCEL_TOKEN"
+          [ -n "$VERCEL_ORG_ID" ] || missing="$missing VERCEL_ORG_ID"
+          [ -n "$VERCEL_PROJECT_ID" ] || missing="$missing VERCEL_PROJECT_ID"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets:$missing (Settings > Secrets and variables > Actions)"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Install Vercel CLI
+        run: npm install --global vercel@latest
+
+      # Uploads the repo (minus .vercelignore) and Vercel builds the container services from vercel.json.
+      - name: Deploy to production
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: vercel deploy --prod --yes --token="$VERCEL_TOKEN"
+
+  # ---------------------------------------------------------------------------------------------------------------
+  aws:
+    needs: resolve-target
+    if: needs.resolve-target.outputs.target == 'aws'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write # OIDC: assume the AWS role without stored access keys
+    env:
+      TF_ACTION: ${{ inputs.terraform_action || 'apply' }}
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+      TF_VAR_aws_region: ${{ vars.AWS_REGION || 'us-east-1' }}
+      TF_VAR_project: ${{ vars.AWS_PROJECT || 'docclassify' }}
+      TF_VAR_instance_type: ${{ vars.AWS_INSTANCE_TYPE || 't3.medium' }}
+      TF_VAR_domain_name: ${{ vars.AWS_DOMAIN_NAME }}
+      TF_VAR_route53_zone_id: ${{ vars.AWS_ROUTE53_ZONE_ID }}
+    defaults:
+      run:
+        working-directory: infra/aws
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "^1.10"
+          terraform_wrapper: false # keep `terraform output -raw` clean
+
+      - name: Terraform init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=$TF_VAR_project/terraform.tfstate" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Terraform validate
+        run: terraform validate
+
+      - name: Terraform plan
+        if: env.TF_ACTION == 'plan'
+        run: terraform plan
+
+      - name: Terraform destroy
+        if: env.TF_ACTION == 'destroy'
+        run: |
+          terraform destroy -auto-approve
+          # The keys are stored by this workflow, not Terraform, so remove them here.
+          aws ssm delete-parameters --names "/$TF_VAR_project/TYPESAFE_API_KEY" "/$TF_VAR_project/ANTHROPIC_API_KEY" > /dev/null
+
+      # ---- apply: infrastructure -> keys -> images -> rollout ----------------------------------------------------
+      - name: Terraform apply
+        if: env.TF_ACTION == 'apply'
+        run: |
+          terraform apply -auto-approve
+          {
+            echo "INSTANCE_ID=$(terraform output -raw instance_id)"
+            echo "SITE_URL=$(terraform output -raw site_url)"
+            echo "ECR_BACKEND=$(terraform output -raw ecr_backend_url)"
+            echo "ECR_FRONTEND=$(terraform output -raw ecr_frontend_url)"
+            echo "PARAM_PREFIX=$(terraform output -raw ssm_parameter_prefix)"
+          } >> "$GITHUB_ENV"
+
+      # Keys go from GitHub secrets straight to SSM Parameter Store (encrypted); they never enter Terraform state.
+      - name: Store API keys in SSM Parameter Store
+        if: env.TF_ACTION == 'apply'
+        env:
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$TYPESAFE_API_KEY" ]; then
+            echo "::error::Repository secret TYPESAFE_API_KEY is not set"; exit 1
+          fi
+          aws ssm put-parameter --name "$PARAM_PREFIX/TYPESAFE_API_KEY" --type SecureString \
+            --value "$TYPESAFE_API_KEY" --overwrite > /dev/null
+          if [ -n "$ANTHROPIC_API_KEY" ]; then
+            aws ssm put-parameter --name "$PARAM_PREFIX/ANTHROPIC_API_KEY" --type SecureString \
+              --value "$ANTHROPIC_API_KEY" --overwrite > /dev/null
+          else
+            # Precise mode off: make sure an old key doesn't linger.
+            aws ssm delete-parameter --name "$PARAM_PREFIX/ANTHROPIC_API_KEY" 2> /dev/null || true
+          fi
+
+      - name: Log in to ECR
+        if: env.TF_ACTION == 'apply'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        if: env.TF_ACTION == 'apply'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push backend image
+        if: env.TF_ACTION == 'apply'
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          target: runtime
+          push: true
+          tags: |
+            ${{ env.ECR_BACKEND }}:${{ github.sha }}
+            ${{ env.ECR_BACKEND }}:latest
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+      - name: Build and push frontend image
+        if: env.TF_ACTION == 'apply'
+        uses: docker/build-push-action@v6
+        with:
+          context: frontend
+          push: true
+          tags: |
+            ${{ env.ECR_FRONTEND }}:${{ github.sha }}
+            ${{ env.ECR_FRONTEND }}:latest
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+
+      - name: Roll out on the instance (SSM Run Command)
+        if: env.TF_ACTION == 'apply'
+        run: |
+          # A new instance needs a minute or two before its SSM agent registers.
+          for _ in $(seq 1 60); do
+            ping="$(aws ssm describe-instance-information \
+              --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+              --query 'InstanceInformationList[0].PingStatus' --output text)"
+            [ "$ping" = "Online" ] && break
+            sleep 10
+          done
+          if [ "$ping" != "Online" ]; then echo "::error::Instance never came online in SSM"; exit 1; fi
+
+          params="$(jq -nc --arg tag "$GITHUB_SHA" --arg project "$TF_VAR_project" '{
+            commands: [
+              "cloud-init status --wait > /dev/null || true",
+              "/opt/\($project)/deploy.sh \($tag)"
+            ],
+            executionTimeout: ["900"]
+          }')"
+          cmd_id="$(aws ssm send-command --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript --comment "deploy ${GITHUB_SHA::7}" \
+            --parameters "$params" --query Command.CommandId --output text)"
+
+          # Poll ourselves: the built-in `aws ssm wait` gives up after 100 s, and image pulls can take longer.
+          status=Pending
+          for _ in $(seq 1 100); do
+            sleep 10
+            status="$(aws ssm get-command-invocation --command-id "$cmd_id" --instance-id "$INSTANCE_ID" \
+              --query Status --output text 2> /dev/null || echo Pending)"
+            case "$status" in Pending|InProgress|Delayed) continue ;; *) break ;; esac
+          done
+
+          aws ssm get-command-invocation --command-id "$cmd_id" --instance-id "$INSTANCE_ID" \
+            --query '[StandardOutputContent, StandardErrorContent]' --output text || true
+          if [ "$status" != "Success" ]; then echo "::error::Deploy command finished with status $status"; exit 1; fi
+
+      - name: Smoke test
+        if: env.TF_ACTION == 'apply'
+        run: |
+          # The first deploy on a new instance waits for Caddy to get its certificate, hence the retries.
+          curl -fsS --retry 12 --retry-delay 10 --retry-all-errors "$SITE_URL/api/health"
+          echo
+          echo "### Deployed to AWS: $SITE_URL" >> "$GITHUB_STEP_SUMMARY"

@@ -142,6 +142,19 @@ All entries dated 2026-10-04 (initial build) unless stated.
 
 ---
 
+## AWS deployment and deploy-target switch (2026-10-11)
+
+- **Single EC2 + compose + Caddy.** Context: the in-memory store needs one long-lived process, and uploads go up to 220 MB. → Decision: one EC2 instance (`infra/aws`, Terraform) running the existing images, with Caddy as the only public entry point. → Alternatives:
+  - ECS/Fargate behind an ALB: more moving parts for a single replica;
+  - Lambda: request-size and runtime limits.
+  → Consequence: no Vercel-style autoscaling risks; a redeploy clears batches that are in progress.
+- **Keys bypass Terraform state.** The workflow writes the keys to SSM Parameter Store (`SecureString`), and `deploy.sh` on the instance renders them into a root-only `.env`.
+- **Deploying from GitHub without stored AWS keys.** GitHub uses OIDC to assume a role that only workflows on `main` can use. The state bucket and that role are created once by `infra/aws/bootstrap`.
+- **One workflow, two targets.** `deploy.yml` replaces `deploy-vercel.yml`. The target comes from the `DEPLOY_TARGET` repo variable on push (default `vercel`, which keeps the old behaviour) or from the manual-run input.
+- **Not verified:** `terraform validate`/`plan`/`apply` and the workflow have not been run, because Terraform and AWS access aren't available on the dev machine.
+
+---
+
 ## Verification status (2026-10-04)
 
 | Check | Result |
