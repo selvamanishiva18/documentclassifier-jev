@@ -1,0 +1,21 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      target: runtime
+    env_file: .env
+    environment:
+      # The browser talks to nginx on :5173, which proxies /api to this service.
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173}
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    depends_on:
+      - backend
+    ports:
+      - "5173:5173"
+    restart: unless-stopped
