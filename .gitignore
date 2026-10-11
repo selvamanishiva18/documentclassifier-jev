@@ -1,0 +1,35 @@
+# ---- Secrets (never commit) --------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.pfx
+*.p12
+secrets/
+.vercel/
+
+# ---- Python (backend) --------------------------------------------------------
+backend/.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- Node (frontend) ---------------------------------------------------------
+frontend/node_modules/
+frontend/dist/
+frontend/coverage/
+npm-debug.log*
+
+# ---- Editors / OS ------------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
